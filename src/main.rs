@@ -3,23 +3,33 @@ use async_stream::stream;
 use bytes::Bytes;
 use image::{ImageBuffer, Luma, RgbImage};
 use std::{
-    process::Command,
+    process::{Command, Child},
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
-use std::process::Child;
+use std::cmp::PartialEq;
 use tokio::{net::TcpStream, io::AsyncReadExt};
 
 /* ================= CONFIG ================= */
 
-const WIDTH: u32 = 320;
-const HEIGHT: u32 = 240;
+const IDLE_WIDTH: u32 = 320;
+const IDLE_HEIGHT: u32 = 240;
+const IDLE_FPS: u32 = 1;
 
-const IDLE_FPS: Duration = Duration::from_secs(1);   // 1 FPS idle
-const ACTIVE_FPS: Duration = Duration::from_millis(33); // 30 FPS on motion
-const MOTION_THRESHOLD: u64 = 120000;
+const ACTIVE_WIDTH: u32 = 640;
+const ACTIVE_HEIGHT: u32 = 320;
+const ACTIVE_FPS: u32 = 30;
+
+const MOTION_THRESHOLD: u64 = 120_000;
 
 /* ================= SHARED STATE ================= */
+
+#[derive(Debug, PartialEq)]
+
+enum CameraState {
+    Idle,
+    MotionDetected,
+}
 
 struct Frames {
     rgb: Option<Vec<u8>>,
@@ -29,31 +39,53 @@ struct Frames {
 struct Camera {
     width: u32,
     height: u32,
-    framerate: u32,
+    fps: u32,
+    state: CameraState,
     process: Option<Child>,
     stream: Option<TcpStream>,
-    frames: Arc<Mutex<Frames>>
-
+    frames: Arc<Mutex<Frames>>,
 }
-/* ================= MAIN ================= */
+
+/* ================= CAMERA ================= */
 
 impl Camera {
-    fn new(width: u32, height: u32, framerate: u32) -> Self {
-        let frames = Arc::new(Mutex::new(Frames {
-            rgb: None,
-            diff: None,
-        }));
-        Self { width, height, framerate, process:None , stream: None, frames: frames }
+    fn new() -> Self {
+        Self {
+            width: IDLE_WIDTH,
+            height: IDLE_HEIGHT,
+            fps: IDLE_FPS,
+            state: CameraState::Idle,
+            process: None,
+            stream: None,
+            frames: Arc::new(Mutex::new(Frames { rgb: None, diff: None })),
+        }
     }
 
-    async fn start(&mut self) {
+    async fn run(&mut self) {
+        self.spawn_camera().await;
+
+        loop {
+            let motion = self.capture_loop().await;
+            match motion {
+                CameraState::MotionDetected=>{
+                    println!("⚡ Motion detected → switching to ACTIVE");
+                    self.restart(ACTIVE_WIDTH, ACTIVE_HEIGHT, ACTIVE_FPS, motion).await;
+                }
+                _ => {
+
+                }
+            }
+        }
+    }
+
+    async fn spawn_camera(&mut self) {
         let child = Command::new("rpicam-vid")
             .args([
                 "-t", "0",
                 "--codec", "mjpeg",
                 "--width", &self.width.to_string(),
                 "--height", &self.height.to_string(),
-                "--framerate", &self.framerate.to_string(),
+                "--framerate", &self.fps.to_string(),
                 "--inline",
                 "--listen",
                 "-o", "tcp://0.0.0.0:8554",
@@ -61,63 +93,42 @@ impl Camera {
             .spawn()
             .expect("failed to start rpicam-vid");
 
+        let stream = connect_camera_tcp().await;
 
-        let stream = {
-            let mut attempt = 0;
-            loop {
-                match TcpStream::connect("127.0.0.1:8554").await {
-                    Ok(s) => {
-                        println!("✅ Connected to camera TCP");
-                        break s;
-                    }
-                    Err(e) => {
-                        attempt += 1;
-                        if attempt >= 5 {
-                            panic!("❌ Camera TCP not ready after 5 attempts: {}", e);
-                        }
-                        println!(
-                            "⏳ Camera TCP not ready (attempt {}/5), retrying...",
-                            attempt
-                        );
-                        tokio::time::sleep(Duration::from_secs(1)).await;
-                    }
-                }
-            }
-        };
-        self.stream = Some(stream);
         self.process = Some(child);
-        loop {
-            let restart = self.capture_loop().await;
-            if restart {
-                self.restart().await;
-            }
+        self.stream = Some(stream);
+
+        println!("📷 Camera running {}x{} @ {}fps", self.width, self.height, self.fps);
+    }
+
+    async fn restart(&mut self, w: u32, h: u32, fps: u32, camera_state: CameraState) {
+        if let Some(mut p) = self.process.take() {
+            let _ = p.kill();
         }
 
-        println!("📷 Camera started ({}x{} @ {}fps)",
-                 self.width, self.height, self.framerate);
+        self.width = w;
+        self.height = h;
+        self.fps = fps;
+        self.state = camera_state;
+
+        self.spawn_camera().await;
     }
 
-    async fn restart(&mut self) {
-        self.process.take().unwrap().kill();
-        self.framerate = 30;
-        self.height = 320;
-        self.width = 640;
-        self.start().await;
-
-    }
-    async fn capture_loop(&mut self) -> bool{
-
+    async fn capture_loop(&mut self) -> CameraState {
         let mut buf = vec![0u8; 128 * 1024];
         let mut prev: Option<Vec<u8>> = None;
         let mut last = Instant::now();
-        let mut active = false;
+
+        let delay = Duration::from_secs(1);
         let mut stream = self.stream.take().unwrap();
+
         loop {
             let n = stream.read(&mut buf).await.unwrap();
             if n == 0 { continue; }
 
-            let delay = if active { ACTIVE_FPS } else { IDLE_FPS };
-            if last.elapsed() < delay { continue; }
+            if last.elapsed() < delay {
+                continue;
+            }
             last = Instant::now();
 
             let img = match image::load_from_memory(&buf[..n]) {
@@ -125,50 +136,46 @@ impl Camera {
                 Err(_) => continue,
             };
 
-            let (motion, diff_img) = if let Some(p) = &prev {
+            let (motion, diff) = if let Some(p) = &prev {
                 frame_diff(p, &img)
             } else {
                 (0, blank_luma(img.width(), img.height()))
             };
 
-            active = motion > MOTION_THRESHOLD;
-            if active {
-                self.restart().await;
-                return true;
-            }
-
             prev = Some(img.clone().into_raw());
 
-            let rgb_jpeg = encode_jpeg_rgb(&img);
-            let diff_jpeg = encode_jpeg_luma(&diff_img);
-
             let mut f = self.frames.lock().unwrap();
-            f.rgb = Some(rgb_jpeg);
-            f.diff = Some(diff_jpeg);
+            f.rgb = Some(encode_jpeg_rgb(&img));
+            f.diff = Some(encode_jpeg_luma(&diff));
+
+            if motion > MOTION_THRESHOLD && self.state != CameraState::MotionDetected{
+                self.stream = Some(stream);
+                return CameraState::MotionDetected;
+            }
         }
     }
 }
 
+/* ================= MAIN ================= */
+
 #[tokio::main]
 async fn main() {
+    let mut cam = Camera::new();
+    let frames = cam.frames.clone();
 
-    let mut cam = Camera::new(WIDTH, HEIGHT, 1);
-    // Background capture loop (ALWAYS RUNNING)
-    let cf = cam.frames.clone();
+    tokio::spawn(async move {
+        cam.run().await;
+    });
+
     let app = Router::new()
         .route("/frame", get({
-            let f = cf.clone();
+            let f = frames.clone();
             move || stream_mjpeg(f, false)
         }))
         .route("/diff", get({
-            let f = cf.clone();
+            let f = frames.clone();
             move || stream_mjpeg(f, true)
         }));
-
-    cam.start().await;
-
-    // HTTP server
-
 
     println!("🌐 http://PI_IP:3000/frame");
     println!("🌐 http://PI_IP:3000/diff");
@@ -181,6 +188,23 @@ async fn main() {
         .unwrap();
 }
 
+/* ================= TCP ================= */
+
+async fn connect_camera_tcp() -> TcpStream {
+    for i in 1..=5 {
+        match TcpStream::connect("127.0.0.1:8554").await {
+            Ok(s) => {
+                println!("✅ Camera TCP connected");
+                return s;
+            }
+            Err(_) => {
+                println!("⏳ Waiting for camera TCP ({}/5)", i);
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        }
+    }
+    panic!("❌ Camera TCP not available");
+}
 
 /* ================= HTTP STREAM ================= */
 
@@ -190,16 +214,16 @@ async fn stream_mjpeg(
 ) -> impl IntoResponse {
     let body = stream! {
         loop {
-            let frame = {
+            let jpeg = {
                 let f = frames.lock().unwrap();
                 if diff { f.diff.clone() } else { f.rgb.clone() }
             };
 
-            if let Some(jpeg) = frame {
+            if let Some(j) = jpeg {
                 yield Ok::<Bytes, std::convert::Infallible>(
                     Bytes::from("--frame\r\nContent-Type: image/jpeg\r\n\r\n")
                 );
-                yield Ok(Bytes::from(jpeg));
+                yield Ok(Bytes::from(j));
             }
 
             tokio::time::sleep(Duration::from_millis(50)).await;
@@ -212,7 +236,7 @@ async fn stream_mjpeg(
     )
 }
 
-/* ================= IMAGE UTILS ================= */
+/* ================= IMAGE ================= */
 
 fn frame_diff(prev: &[u8], curr: &RgbImage)
               -> (u64, ImageBuffer<Luma<u8>, Vec<u8>>)
@@ -232,10 +256,7 @@ fn frame_diff(prev: &[u8], curr: &RgbImage)
         out.push(g);
     }
 
-    (
-        sum,
-        ImageBuffer::from_raw(curr.width(), curr.height(), out).unwrap()
-    )
+    (sum, ImageBuffer::from_raw(curr.width(), curr.height(), out).unwrap())
 }
 
 fn blank_luma(w: u32, h: u32) -> ImageBuffer<Luma<u8>, Vec<u8>> {
@@ -256,15 +277,4 @@ fn encode_jpeg_luma(img: &ImageBuffer<Luma<u8>, Vec<u8>>) -> Vec<u8> {
         .encode_image(img)
         .unwrap();
     out
-}
-
-/* ================= AI HOOK ================= */
-
-fn ai_hook(_img: &RgbImage, motion: u64) {
-    println!("🧠 AI HOOK | motion={}", motion);
-
-    // Drop-in points:
-    // - Resize
-    // - Normalize
-    // - Send to YOLO / TFLite / AI HAT
 }
