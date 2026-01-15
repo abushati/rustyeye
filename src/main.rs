@@ -8,6 +8,7 @@ use std::{
     time::{Duration, Instant},
 };
 use std::cmp::PartialEq;
+use std::collections::VecDeque;
 use std::process::Stdio;
 use tokio::{net::TcpStream, io::AsyncReadExt};
 
@@ -37,6 +38,7 @@ enum CameraState {
 struct Frames {
     rgb: Option<Vec<u8>>,
     diff: Option<Vec<u8>>,
+    jpeg: Option<Vec<u8>>
 }
 
 struct Camera {
@@ -60,7 +62,7 @@ impl Camera {
             state: CameraState::Idle,
             process: None,
             stream: None,
-            frames: Arc::new(Mutex::new(Frames { rgb: None, diff: None })),
+            frames: Arc::new(Mutex::new(Frames { rgb: None, diff: None , jpeg: None })),
         }
     }
 
@@ -70,11 +72,11 @@ impl Camera {
         loop {
             let motion = self.capture_loop().await;
             match motion {
-                CameraState::MotionDetected=>{
+                CameraState::MotionDetected => {
                     println!("⚡ Motion detected → switching to ACTIVE");
                     self.restart(ACTIVE_WIDTH, ACTIVE_HEIGHT, ACTIVE_FPS, motion).await;
                 }
-                CameraState::Idle=>{
+                CameraState::Idle => {
                     println!("⚡ Motion not detected → switching to IDLE");
                     self.restart(IDLE_WIDTH, IDLE_HEIGHT, IDLE_FPS, motion).await;
                 }
@@ -124,24 +126,27 @@ impl Camera {
 
     async fn capture_loop(&mut self) -> CameraState {
         let mut buf = vec![0u8; 128 * 1024];
-        let mut prev: Option<Vec<u8>> = None;
-        let mut last = Instant::now();
-        let mut motion_history= vec![true; 1000];
+        let mut prev: Option<RgbImage> = None;
+        let mut motion_history = vec![true; 1000];
 
-        let delay = Duration::from_secs(1);
+
         let mut stream = self.stream.take().unwrap();
+
         loop {
             let n = stream.read(&mut buf).await.unwrap();
             if n == 0 { continue; }
 
-            if last.elapsed() < delay {
-                continue;
+            let jpeg_frame = buf[..n].to_vec();
+
+            // Store MJPEG directly
+            {
+                let mut f = self.frames.lock().unwrap();
+                f.jpeg = Some(jpeg_frame.clone());
             }
-            last = Instant::now();
 
-
-            let img = match image::load_from_memory(&buf[..n]) {
-                Ok(i) => i.to_rgb8(),
+            // Decode SMALL image only
+            let img = match image::load_from_memory(&jpeg_frame) {
+                Ok(i) => i.resize(160, 120, image::imageops::FilterType::Nearest).to_rgb8(),
                 Err(_) => continue,
             };
 
@@ -151,34 +156,31 @@ impl Camera {
             } else {
                 (0.0, blank_luma(img.width(), img.height()))
             };
-
-            let mut motion_detected = false;
-            if prev.is_some() {
-                motion_detected = motion_ratio > 0.03; // 2% threshold
-            } else {
-                motion_detected = false;
-            }
+            prev = Some(img);
+            let motion_detected = motion_ratio > 0.03;
 
             motion_history.push(motion_detected);
 
-            prev = Some(img.clone().into_raw());
+            {
+                let mut f = self.frames.lock().unwrap();
+                f.diff = Some(encode_jpeg_luma(&diff));
+            }
 
-            let mut f = self.frames.lock().unwrap();
-            f.rgb = Some(encode_jpeg_rgb(&img));
-            f.diff = Some(encode_jpeg_luma(&diff));
 
-            if motion_detected && self.state != CameraState::MotionDetected{
+            if motion_detected && self.state != CameraState::MotionDetected {
                 self.stream = Some(stream);
                 return CameraState::MotionDetected;
             }
-            if self.state == CameraState::MotionDetected {
-                if motion_history[motion_history.len().
-                    saturating_sub(50)..]
-                    .iter()
-                    .all(|&x| x == false) {
 
-                    return CameraState::Idle;
-                }
+            if self.state == CameraState::MotionDetected
+                && motion_history[motion_history.len().
+                saturating_sub(200)..]
+                .iter()
+                .all(|&x| x == false)
+            {
+                println!("{}", motion_history.len());
+                self.stream = Some(stream);
+                return CameraState::Idle;
             }
         }
     }
@@ -244,7 +246,7 @@ async fn stream_mjpeg(
         loop {
             let jpeg = {
                 let f = frames.lock().unwrap();
-                if diff { f.diff.clone() } else { f.rgb.clone() }
+                if diff { f.diff.clone() } else { f.jpeg.clone() }
             };
 
             if let Some(j) = jpeg {
