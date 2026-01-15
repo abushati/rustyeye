@@ -8,7 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 use std::cmp::PartialEq;
-use std::collections::VecDeque;
+
+use chrono::Utc;
 use std::process::Stdio;
 use tokio::{net::TcpStream, io::AsyncReadExt};
 
@@ -71,13 +72,14 @@ impl Camera {
 
         loop {
             let motion = self.capture_loop().await;
+            let utc_string = Utc::now().to_rfc3339();
             match motion {
                 CameraState::MotionDetected => {
-                    println!("⚡ Motion detected → switching to ACTIVE");
+                    println!("⚡ Motion detected → switching to ACTIVE at {:?}", utc_string);
                     self.restart(ACTIVE_WIDTH, ACTIVE_HEIGHT, ACTIVE_FPS, motion).await;
                 }
                 CameraState::Idle => {
-                    println!("⚡ Motion not detected → switching to IDLE");
+                    println!("⚡ Motion not detected → switching to IDLE at {:?}", utc_string);
                     self.restart(IDLE_WIDTH, IDLE_HEIGHT, IDLE_FPS, motion).await;
                 }
             }
@@ -128,6 +130,7 @@ impl Camera {
         let mut buf = vec![0u8; 128 * 1024];
         let mut prev: Option<RgbImage> = None;
         let mut motion_history = vec![true; 1000];
+        let start_time = Instant::now();
 
 
         let mut stream = self.stream.take().unwrap();
@@ -167,9 +170,12 @@ impl Camera {
             }
 
 
-            if motion_detected && self.state != CameraState::MotionDetected {
-                self.stream = Some(stream);
-                return CameraState::MotionDetected;
+            if motion_detected && self.state
+                != CameraState::MotionDetected &&
+                Instant::now() - start_time > Duration::from_secs(10) {
+                    self.stream = Some(stream);
+                    println!("Motion Detected value {}", motion_detected);
+                    return CameraState::MotionDetected;
             }
 
             if self.state == CameraState::MotionDetected
