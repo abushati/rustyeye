@@ -8,10 +8,13 @@ use std::{
     time::{Duration, Instant},
 };
 use std::cmp::PartialEq;
+use std::process::Stdio;
 use tokio::{net::TcpStream, io::AsyncReadExt};
 
 /* ================= CONFIG ================= */
 
+const PIXEL_NOISE_THRESHOLD: u8 = 8;   // ignore jpeg/ISP jitter
+const MOTION_PIXEL_VALUE: u8 = 255;
 const IDLE_WIDTH: u32 = 320;
 const IDLE_HEIGHT: u32 = 240;
 const IDLE_FPS: u32 = 1;
@@ -71,8 +74,9 @@ impl Camera {
                     println!("⚡ Motion detected → switching to ACTIVE");
                     self.restart(ACTIVE_WIDTH, ACTIVE_HEIGHT, ACTIVE_FPS, motion).await;
                 }
-                _ => {
-
+                CameraState::Idle=>{
+                    println!("⚡ Motion not detected → switching to IDLE");
+                    self.restart(IDLE_WIDTH, IDLE_HEIGHT, IDLE_FPS, motion).await;
                 }
             }
         }
@@ -88,8 +92,12 @@ impl Camera {
                 "--framerate", &self.fps.to_string(),
                 "--inline",
                 "--listen",
+                "--info-text", "",
+                "--nopreview",
                 "-o", "tcp://0.0.0.0:8554",
             ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .spawn()
             .expect("failed to start rpicam-vid");
 
@@ -118,10 +126,10 @@ impl Camera {
         let mut buf = vec![0u8; 128 * 1024];
         let mut prev: Option<Vec<u8>> = None;
         let mut last = Instant::now();
+        let mut motion_history= vec![true; 1000];
 
         let delay = Duration::from_secs(1);
         let mut stream = self.stream.take().unwrap();
-
         loop {
             let n = stream.read(&mut buf).await.unwrap();
             if n == 0 { continue; }
@@ -131,16 +139,27 @@ impl Camera {
             }
             last = Instant::now();
 
+
             let img = match image::load_from_memory(&buf[..n]) {
                 Ok(i) => i.to_rgb8(),
                 Err(_) => continue,
             };
 
-            let (motion, diff) = if let Some(p) = &prev {
-                frame_diff(p, &img)
+
+            let (motion_ratio, diff) = if let Some(prev) = &prev {
+                frame_diff(prev, &img)
             } else {
-                (0, blank_luma(img.width(), img.height()))
+                (0.0, blank_luma(img.width(), img.height()))
             };
+
+            let mut motion_detected = false;
+            if prev.is_some() {
+                motion_detected = motion_ratio > 0.03; // 2% threshold
+            } else {
+                motion_detected = false;
+            }
+
+            motion_history.push(motion_detected);
 
             prev = Some(img.clone().into_raw());
 
@@ -148,9 +167,18 @@ impl Camera {
             f.rgb = Some(encode_jpeg_rgb(&img));
             f.diff = Some(encode_jpeg_luma(&diff));
 
-            if motion > MOTION_THRESHOLD && self.state != CameraState::MotionDetected{
+            if motion_detected && self.state != CameraState::MotionDetected{
                 self.stream = Some(stream);
                 return CameraState::MotionDetected;
+            }
+            if self.state == CameraState::MotionDetected {
+                if motion_history[motion_history.len().
+                    saturating_sub(50)..]
+                    .iter()
+                    .all(|&x| x == false) {
+
+                    return CameraState::Idle;
+                }
             }
         }
     }
@@ -238,25 +266,45 @@ async fn stream_mjpeg(
 
 /* ================= IMAGE ================= */
 
-fn frame_diff(prev: &[u8], curr: &RgbImage)
-              -> (u64, ImageBuffer<Luma<u8>, Vec<u8>>)
-{
+fn frame_diff(
+    prev_rgb: &[u8],
+    curr: &RgbImage,
+) -> (f32, ImageBuffer<Luma<u8>, Vec<u8>>) {
+
     let raw = curr.as_raw();
-    let mut out = Vec::with_capacity(raw.len() / 3);
-    let mut sum = 0u64;
+    let mut diff = Vec::with_capacity(raw.len() / 3);
+
+    let mut changed_pixels: u32 = 0;
+    let total_pixels = (raw.len() / 3) as u32;
 
     for i in (0..raw.len()).step_by(3) {
-        let d =
-            (prev[i] as i16 - raw[i] as i16).abs() +
-                (prev[i+1] as i16 - raw[i+1] as i16).abs() +
-                (prev[i+2] as i16 - raw[i+2] as i16).abs();
+        // Convert both frames to grayscale on the fly
+        let prev_gray =
+            (prev_rgb[i] as u16 * 30 +
+                prev_rgb[i + 1] as u16 * 59 +
+                prev_rgb[i + 2] as u16 * 11) / 100;
 
-        let g = (d / 3).min(255) as u8;
-        sum += g as u64;
-        out.push(g);
+        let curr_gray =
+            (raw[i] as u16 * 30 +
+                raw[i + 1] as u16 * 59 +
+                raw[i + 2] as u16 * 11) / 100;
+
+        let d = (prev_gray as i16 - curr_gray as i16).abs() as u8;
+
+        if d > PIXEL_NOISE_THRESHOLD {
+            diff.push(MOTION_PIXEL_VALUE);
+            changed_pixels += 1;
+        } else {
+            diff.push(0);
+        }
     }
 
-    (sum, ImageBuffer::from_raw(curr.width(), curr.height(), out).unwrap())
+    let motion_ratio = changed_pixels as f32 / total_pixels as f32;
+
+    (
+        motion_ratio,
+        ImageBuffer::from_raw(curr.width(), curr.height(), diff).unwrap()
+    )
 }
 
 fn blank_luma(w: u32, h: u32) -> ImageBuffer<Luma<u8>, Vec<u8>> {
