@@ -8,9 +8,10 @@ use std::{
     time::{Duration, Instant},
 };
 use std::cmp::PartialEq;
-
+use std::io::Write;
 use chrono::Utc;
 use std::process::Stdio;
+use std::thread::sleep;
 use tokio::{net::TcpStream, io::AsyncReadExt};
 
 /* ================= CONFIG ================= */
@@ -50,12 +51,17 @@ struct Camera {
     process: Option<Child>,
     stream: Option<TcpStream>,
     frames: Arc<Mutex<Frames>>,
+    recorder_sender: tokio::sync::mpsc::Sender<Vec<u8>>,
+    recorder_receiver: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>
 }
+
+
 
 /* ================= CAMERA ================= */
 
 impl Camera {
     fn new() -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel::<Vec<u8>>(33);
         Self {
             width: IDLE_WIDTH,
             height: IDLE_HEIGHT,
@@ -64,6 +70,9 @@ impl Camera {
             process: None,
             stream: None,
             frames: Arc::new(Mutex::new(Frames { rgb: None, diff: None , jpeg: None })),
+            recorder_sender: tx,
+            recorder_receiver: Some(rx)
+
         }
     }
 
@@ -126,7 +135,7 @@ impl Camera {
         self.spawn_camera().await;
     }
 
-    async fn capture_loop(&mut self) -> CameraState {
+    async fn capture_loop(&mut self ) -> CameraState {
         let mut buf = vec![0u8; 128 * 1024];
         let mut prev: Option<RgbImage> = None;
         let mut motion_history = vec![true; 1000];
@@ -134,13 +143,21 @@ impl Camera {
 
 
         let mut stream = self.stream.take().unwrap();
-
+        let frame_interval = Duration::from_millis(1000 / self.fps as u64);
+        let mut last_frame_time = Instant::now() - frame_interval;
         loop {
             let n = stream.read(&mut buf).await.unwrap();
             if n == 0 { continue; }
 
             let jpeg_frame = buf[..n].to_vec();
 
+            let now = Instant::now();
+            if now - last_frame_time >= frame_interval {
+                self.recorder_sender.send(jpeg_frame.clone()).await.unwrap();
+                last_frame_time = now;
+            }
+
+            // self.recorder_sender.send(jpeg_frame.clone()).await.unwrap();
             // Store MJPEG directly
             {
                 let mut f = self.frames.lock().unwrap();
@@ -170,37 +187,103 @@ impl Camera {
             }
 
 
-            if motion_detected && self.state
-                != CameraState::MotionDetected &&
-                Instant::now() - start_time > Duration::from_secs(10) {
-                    self.stream = Some(stream);
-                    println!("Motion Detected value {}", motion_detected);
-                    return CameraState::MotionDetected;
-            }
-
-            if self.state == CameraState::MotionDetected
-                && motion_history[motion_history.len().
-                saturating_sub(200)..]
-                .iter()
-                .all(|&x| x == false)
-            {
-                println!("{}", motion_history.len());
-                self.stream = Some(stream);
-                return CameraState::Idle;
-            }
+            // if motion_detected && self.state
+            //     != CameraState::MotionDetected &&
+            //     Instant::now() - start_time > Duration::from_secs(10) {
+            //         self.stream = Some(stream);
+            //         println!("Motion Detected value {}", motion_detected);
+            //         return CameraState::MotionDetected;
+            // }
+            //
+            // if self.state == CameraState::MotionDetected
+            //     && motion_history[motion_history.len().
+            //     saturating_sub(200)..]
+            //     .iter()
+            //     .all(|&x| x == false)
+            // {
+            //     println!("{}", motion_history.len());
+            //     self.stream = Some(stream);
+            //     return CameraState::Idle;
+            // }
         }
     }
 }
+
+struct Recorder {
+    receiver: tokio::sync::mpsc::Receiver<Vec<u8>>,
+    mp4_writer: Option<Child>,
+}
+
+impl Recorder {
+    fn new(receiver: tokio::sync::mpsc::Receiver<Vec<u8>>) -> Self {
+        Self { receiver , mp4_writer: None }
+    }
+    fn start_ffmpeg(&mut self) -> Child {
+        let filename = format!(
+            "recording_{}.mp4",
+            Utc::now().format("%Y%m%d_%H%M%S")
+        );
+         Command::new("ffmpeg")
+            .args([
+                "-y",
+                "-loglevel", "error",
+                "-f", "mjpeg",
+                "-framerate", "10",
+                "-i", "pipe:0",
+                "-c:v", "copy",
+                &filename,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("failed to start ffmpeg")
+    }
+
+    async fn recorder_task(&mut self) {
+        println!("\u{1F3AC} Recorder started ");
+        self.mp4_writer = Some(self.start_ffmpeg());
+        let w = self.mp4_writer.as_mut().unwrap();
+
+        let frame_interval = Duration::from_millis(1000 / 30);
+        let mut last_frame_time = Instant::now();
+
+        while let Some(frame) = self.receiver.recv().await {
+
+            if let Some(stdin) = w.stdin.as_mut() {
+                stdin.write_all(&frame).unwrap();
+            }
+            last_frame_time = Instant::now();
+
+        }
+
+
+        // Graceful shutdown
+        let _ = w.stdin.take();
+        let _ = w.wait();
+        println!("🎬 Recording finished");
+    }
+}
+
+
+
 
 /* ================= MAIN ================= */
 
 #[tokio::main]
 async fn main() {
     let mut cam = Camera::new();
+    let recorder_receiver = cam.recorder_receiver.take().unwrap();
+    let recorder = Recorder::new(recorder_receiver);
+
     let frames = cam.frames.clone();
 
     tokio::spawn(async move {
         cam.run().await;
+    });
+    tokio::spawn(async move {
+        let mut recorder = recorder;
+        recorder.recorder_task().await;
     });
 
     let app = Router::new()
