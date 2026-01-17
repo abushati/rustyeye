@@ -225,26 +225,41 @@ impl Recorder {
         let filename = format!("recording_{}.avi", Utc::now().format("%Y%m%d_%H%M%S"));
         println!("Video file {filename}");
 
-        Command::new("ffmpeg")
+        let child = Command::new("ffmpeg")
             .args([
                 "-y",
                 "-loglevel", "error",
+
+                // input: MJPEG frames from stdin
                 "-f", "mjpeg",
-                // "-framerate", &self.frame_rate.lock().unwrap().to_string(),  // << important!
+                "-framerate", &self.frame_rate.lock().unwrap().to_string(),
                 "-i", "pipe:0",
-                "-c:v", "copy",
-                // "-c:v", "libx264",
-                // "-preset", "veryfast",
-                // "-crf", "23",
-                // "-pix_fmt", "yuv420p",
-                "-f", "avi",
-                &filename,
+
+                // video encoding (cold storage)
+                "-c:v", "libx264",
+                "-preset", "slow",
+                "-crf", "30",
+                "-pix_fmt", "yuv420p",
+
+                // segmentation
+                "-f", "segment",
+                "-segment_time", "5",
+                "-reset_timestamps", "1",
+
+                // important for MP4 segments
+                "-movflags", "+faststart",
+                "-strftime", "1",
+
+                // output pattern
+                "recording2_%Y%m%d_%H%M%S_%03d.mp4",
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("failed to start ffmpeg")
+            .expect("failed to start ffmpeg");
+
+        child
     }
 
     async fn recorder_task(&mut self) {
