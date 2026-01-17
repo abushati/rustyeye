@@ -1,7 +1,7 @@
 use axum::{Router, routing::get, body::Body, response::IntoResponse};
 use async_stream::stream;
 use bytes::Bytes;
-use image::{ImageBuffer, Luma, RgbImage};
+use image::{GrayImage, ImageBuffer, Luma, RgbImage};
 use std::{
     process::{Command, Child},
     sync::{Arc, Mutex},
@@ -57,8 +57,8 @@ impl Camera {
         let fps = Arc::new(Mutex::new(IDLE_FPS));
         (
             Self {
-                width: IDLE_WIDTH,
-                height: IDLE_HEIGHT,
+                width: ACTIVE_WIDTH,
+                height: ACTIVE_HEIGHT,
                 fps: fps.clone(),
                 state: CameraState::Idle,
                 process: None,
@@ -81,18 +81,17 @@ impl Camera {
             match motion {
                 CameraState::MotionDetected => {
                     println!("⚡ Motion detected → switching to ACTIVE at {:?}", utc_string);
-                    self.restart(ACTIVE_WIDTH, ACTIVE_HEIGHT, ACTIVE_FPS, motion).await;
+                    self.restart(ACTIVE_FPS, motion).await;
                 }
                 CameraState::Idle => {
                     println!("⚡ Motion not detected → switching to IDLE at {:?}", utc_string);
-                    self.restart(IDLE_WIDTH, IDLE_HEIGHT, IDLE_FPS, motion).await;
+                    self.restart(IDLE_FPS, motion).await;
                 }
             }
         }
     }
 
     async fn spawn_camera(&mut self) {
-
         let child = Command::new("rpicam-vid")
             .args([
                 "-t", "0",
@@ -115,15 +114,12 @@ impl Camera {
         println!("📷 Camera running {}x{} @ {}fps", self.width, self.height, self.fps.lock().unwrap().to_string());
     }
 
-    async fn restart(&mut self, w: u32, h: u32, fps: u32, camera_state: CameraState){
+    async fn restart(&mut self, fps: u32, camera_state: CameraState){
         if let Some(mut p) = self.process.as_mut() {
             let _ = p.kill();
             self.process = None;
 
         }
-
-        self.width = w;
-        self.height = h;
         *self.fps.lock().unwrap() = fps;
         self.state = camera_state;
 
@@ -145,7 +141,7 @@ impl Camera {
         let handle: tokio::task::JoinHandle<CameraState> = tokio::task::spawn_blocking(move || {
             let mut buf = [0u8; 4096];
             let mut acc = Vec::<u8>::new();
-            let mut prev: Option<RgbImage> = None;
+            let mut prev: Option<GrayImage> = None;
             let mut motion_history = vec![true; 1000];
 
             loop {
@@ -168,22 +164,17 @@ impl Camera {
 
                     // Motion diff
                     let img = match image::load_from_memory(&frame) {
-                        Ok(i) => i.resize(160, 120, image::imageops::FilterType::Nearest).to_rgb8(),
+                        Ok(i) => i.resize(160, 120, image::imageops::FilterType::Nearest).to_luma8(),
                         Err(_) => continue,
                     };
 
-                    let (motion_ratio, diff) = if let Some(prev) = &prev {
+                    let motion_ratio = if let Some(prev) = &prev {
                         frame_diff(prev, &img)
                     } else {
-                        (0.0, blank_luma(img.width(), img.height()))
+                        0.0
                     };
 
                     prev = Some(img);
-
-                    {
-                        let mut f = frames.lock().unwrap();
-                        f.diff = Some(encode_jpeg_luma(&diff));
-                    }
 
                     let motion_detected = motion_ratio > 0.03;
                     motion_history.push(motion_detected);
@@ -239,12 +230,13 @@ impl Recorder {
                 "-y",
                 "-loglevel", "error",
                 "-f", "mjpeg",
-                "-framerate", &self.frame_rate.lock().unwrap().to_string(),  // << important!
+                // "-framerate", &self.frame_rate.lock().unwrap().to_string(),  // << important!
                 "-i", "pipe:0",
-                "-c:v", "libx264",
-                "-preset", "veryfast",
-                "-crf", "23",
-                "-pix_fmt", "yuv420p",
+                "-c:v", "copy",
+                // "-c:v", "libx264",
+                // "-preset", "veryfast",
+                // "-crf", "23",
+                // "-pix_fmt", "yuv420p",
                 "-f", "avi",
                 &filename,
             ])
@@ -305,32 +297,28 @@ async fn stream_mjpeg(
 /* ================= IMAGE HELPERS ================= */
 
 fn frame_diff(
-    prev_rgb: &[u8],
-    curr: &RgbImage,
-) -> (f32, ImageBuffer<Luma<u8>, Vec<u8>>) {
-    let raw = curr.as_raw();
-    let mut diff = Vec::with_capacity(raw.len() / 3);
+    prev: &GrayImage,
+    curr: &GrayImage,
+) -> f32 {
+    let mut diff = GrayImage::new(curr.width(), curr.height());
 
-    let mut changed_pixels: u32 = 0;
-    let total_pixels = (raw.len() / 3) as u32;
+    let mut changed = 0u32;
+    let total = curr.width() * curr.height();
 
-    for i in (0..raw.len()).step_by(3) {
-        let prev_gray = (prev_rgb[i] as u16 * 30 + prev_rgb[i + 1] as u16 * 59 + prev_rgb[i + 2] as u16 * 11) / 100;
-        let curr_gray = (raw[i] as u16 * 30 + raw[i + 1] as u16 * 59 + raw[i + 2] as u16 * 11) / 100;
-        let d = (prev_gray as i16 - curr_gray as i16).abs() as u8;
+    for (x, y, p) in curr.enumerate_pixels() {
+        let d = prev.get_pixel(x, y)[0].abs_diff(p[0]);
 
         if d > PIXEL_NOISE_THRESHOLD {
-            diff.push(MOTION_PIXEL_VALUE);
-            changed_pixels += 1;
+            diff.put_pixel(x, y, Luma([255]));
+            changed += 1;
         } else {
-            diff.push(0);
+            diff.put_pixel(x, y, Luma([0]));
         }
     }
 
-    let motion_ratio = changed_pixels as f32 / total_pixels as f32;
-
-    (motion_ratio, ImageBuffer::from_raw(curr.width(), curr.height(), diff).unwrap())
+    changed as f32 / total as f32
 }
+
 
 fn blank_luma(w: u32, h: u32) -> ImageBuffer<Luma<u8>, Vec<u8>> {
     ImageBuffer::from_pixel(w, h, Luma([0]))
