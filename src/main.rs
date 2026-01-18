@@ -2,29 +2,47 @@ use axum::{Router, routing::get, body::Body, response::IntoResponse};
 use async_stream::stream;
 use bytes::Bytes;
 use image::{GrayImage, ImageBuffer, Luma, RgbImage};
-use std::{
-    process::{Command, Child},
-    sync::{Arc, Mutex},
-    time::Duration,
-    io::{Read, Write},
-};
-use chrono::Utc;
+use std::{process::{Command, Child}, sync::{Arc, Mutex}, time::Duration, io::{Read, Write}, fs, os};
+use std::fmt::format;
+use std::path::Path;
+use chrono::{Local, Utc};
 use std::process::Stdio;
 use std::thread::sleep;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use serde::Deserialize;
+use lazy_static::lazy_static;
+use tokio::io::join;
 /* ================= CONFIG ================= */
 
 const PIXEL_NOISE_THRESHOLD: u8 = 8;   // ignore jpeg/ISP jitter
-const MOTION_PIXEL_VALUE: u8 = 255;
-const IDLE_WIDTH: u32 = 320;
-const IDLE_HEIGHT: u32 = 240;
 const IDLE_FPS: u32 = 1;
 
 const ACTIVE_WIDTH: u32 = 640;
 const ACTIVE_HEIGHT: u32 = 320;
 const ACTIVE_FPS: u32 = 30;
 
+#[derive(Deserialize)]
+struct VideoConfig {
+    framerate: u32,
+    state_change_cooldown: u32,
+    motion_ratio_threshold: f32,
+    log_level: u32,
+}
+
+#[derive(Deserialize)]
+struct RecorderConfig {
+    framerate: u32,
+    base_recording_folder: String,
+    seperator_folder: String,
+    file_name_format: String,
+    file_path: String
+}
+#[derive(Deserialize)]
+pub struct Config {
+    video: VideoConfig,
+    recorder: RecorderConfig,
+}
 /* ================= SHARED STATE ================= */
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -49,6 +67,13 @@ struct Camera {
     recorder_sender: mpsc::UnboundedSender<Vec<u8>>,
 }
 
+
+lazy_static! {
+    pub static ref CONFIG: Config = {
+        let contents = fs::read_to_string("config.toml").expect("Failed to read config.toml");
+        toml::from_str(&contents).expect("Failed to parse config.toml")
+    };
+}
 /* ================= CAMERA ================= */
 
 impl Camera {
@@ -145,6 +170,9 @@ impl Camera {
             let mut motion_history = vec![true; 1000];
 
             loop {
+                if CONFIG.video.log_level == 0 {
+                    println!("DEBUGGG");
+                }
                 let n = stdout.read(&mut buf).unwrap();
                 if n == 0 { continue; }
 
@@ -158,10 +186,8 @@ impl Camera {
 
                     // Send JPEG
                     if state == CameraState::MotionDetected {
-                        println!("Sending frame to record");
                         let _ = tx.send(frame.clone());
                     }
-                    println!("NOT Sending frame to record");
                     // Store latest frame for HTTP
                     {
                         let mut f = frames.lock().unwrap();
@@ -181,11 +207,11 @@ impl Camera {
                     };
 
                     prev = Some(img);
-
-                    let motion_detected = motion_ratio > 0.05;
+                    println!("{}", motion_ratio);
+                    let motion_detected = motion_ratio > CONFIG.video.motion_ratio_threshold;
                     motion_history.push(motion_detected);
 
-                    if state_change_cooldown.as_mut().unwrap().elapsed() < Duration::from_secs(10) {
+                    if state_change_cooldown.as_mut().unwrap().elapsed() < Duration::from_secs(CONFIG.video.state_change_cooldown as u64) {
                         println!("{:?}", state_change_cooldown.as_mut().unwrap().elapsed());
                         continue;
                     }
@@ -219,17 +245,29 @@ impl Camera {
 
 struct Recorder {
     receiver: mpsc::UnboundedReceiver<Vec<u8>>,
-    mp4_writer: Option<Child>,
+    mp4_writer: Child,
     frame_rate: Arc<Mutex<u32>>,
 }
 
 impl Recorder {
-    fn new(receiver: mpsc::UnboundedReceiver<Vec<u8>>, frame_rate:Arc<Mutex<u32>>) -> Self {
-        Self { receiver, mp4_writer: None , frame_rate}
-    }
+    fn start_ffmpeg() -> Child {
+        let filename = Local::now().format(&CONFIG.recorder.file_name_format).to_string();
+        let seperator_folder = Local::now().format(&CONFIG.recorder.seperator_folder).to_string();
+        let template = &CONFIG.recorder.file_path;
+        let file = template
+            .replace("{base_recording_folder}", &CONFIG.recorder.base_recording_folder)
+            .replace("{seperator_folder}", &*seperator_folder)
+            .replace("{file_name_format}", &*filename);
 
-    fn start_ffmpeg(&mut self) -> Child {
-        let filename = format!("recording_{}.avi", Utc::now().format("%Y%m%d_%H%M%S"));
+        let d = format!("{}/{}", &CONFIG.recorder.base_recording_folder, &seperator_folder);
+        if !Path::new(&d).exists() {
+            // create directory (and any missing parent folders)
+            fs::create_dir_all(&d).expect("Failed to create directory");
+            println!("Created directory: {}", &d);
+        } else {
+            println!("Directory already exists: {}", &d);
+        }
+
         println!("Video file {filename}");
 
         let child = Command::new("ffmpeg")
@@ -239,7 +277,7 @@ impl Recorder {
 
                 // input: MJPEG frames from stdin
                 "-f", "mjpeg",
-                "-framerate", "30",
+                // "-framerate", "30",
                 "-i", "pipe:0",
 
                 // 🔹 BURN TIMESTAMP ON VIDEO
@@ -258,32 +296,32 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
                 "-strftime", "1",
 
                 // output pattern
-                "recording2_%Y%m%d_%H%M%S_%03d.mp4",
+                file.as_str(),
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
             .stderr(Stdio::inherit())
             .spawn()
             .expect("failed to start ffmpeg");
-
-
         child
     }
 
+    fn new(receiver: mpsc::UnboundedReceiver<Vec<u8>>, frame_rate:Arc<Mutex<u32>>) -> Self {
+        Self { receiver, mp4_writer: Recorder::start_ffmpeg() , frame_rate }
+    }
+    // fn file_rotator(&self)
+
     async fn recorder_task(&mut self) {
         println!("🎬 Recorder started");
-        self.mp4_writer = Some(self.start_ffmpeg());
-        let w = self.mp4_writer.as_mut().unwrap();
-
         while let Some(frame) = self.receiver.recv().await {
-            if let Some(stdin) = w.stdin.as_mut() {
+            if let Some(stdin) = self.mp4_writer.stdin.as_mut() {
                 let _ = stdin.write_all(&frame);
                 stdin.flush().unwrap();
             }
         }
 
-        let _ = w.stdin.take();
-        let _ = w.wait();
+        let _ = self.mp4_writer.stdin.take();
+        let _ = self.mp4_writer.wait();
         println!("🎬 Recording finished");
     }
 }

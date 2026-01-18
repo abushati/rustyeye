@@ -10,3 +10,6 @@ async-stream = "0.3"
 image = "0.25"
 bytes = "1.5"
 chrono = "0.4.43"
+serde = { version = "1.0.228", features = ["derive"] }
+lazy_static = "1.5.0"
+toml = "0.9.11+spec-1.1.0"
