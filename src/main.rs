@@ -133,7 +133,7 @@ impl Camera {
 
         let tx = self.recorder_sender.clone();
         let frames = self.frames.clone();
-        let state_change_cooldown = Instant::now();
+        let mut state_change_cooldown = None;
 
         // local state copy (do not use self.state inside spawn_blocking)
         let mut state = self.state;
@@ -151,11 +151,17 @@ impl Camera {
                 acc.extend_from_slice(&buf[..n]);
 
                 while let Some(end) = acc.windows(2).position(|w| w == [0xFF, 0xD9]) {
+                    if state_change_cooldown.is_none() {
+                        state_change_cooldown = Some(Instant::now());
+                    }
                     let frame = acc.drain(..end + 2).collect::<Vec<u8>>();
 
                     // Send JPEG
-                    let _ = tx.send(frame.clone());
-
+                    if state == CameraState::MotionDetected {
+                        println!("Sending frame to record");
+                        let _ = tx.send(frame.clone());
+                    }
+                    println!("NOT Sending frame to record");
                     // Store latest frame for HTTP
                     {
                         let mut f = frames.lock().unwrap();
@@ -176,10 +182,11 @@ impl Camera {
 
                     prev = Some(img);
 
-                    let motion_detected = motion_ratio > 0.03;
+                    let motion_detected = motion_ratio > 0.05;
                     motion_history.push(motion_detected);
 
-                    if state_change_cooldown.elapsed() < Duration::from_secs(3) {
+                    if state_change_cooldown.as_mut().unwrap().elapsed() < Duration::from_secs(10) {
+                        println!("{:?}", state_change_cooldown.as_mut().unwrap().elapsed());
                         continue;
                     }
 
@@ -232,8 +239,13 @@ impl Recorder {
 
                 // input: MJPEG frames from stdin
                 "-f", "mjpeg",
-                "-framerate", &self.frame_rate.lock().unwrap().to_string(),
+                "-framerate", "30",
                 "-i", "pipe:0",
+
+                // 🔹 BURN TIMESTAMP ON VIDEO
+                "-vf",
+                "drawtext=fontfile=/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf:\
+text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0.4",
 
                 // video encoding (cold storage)
                 "-c:v", "libx264",
@@ -241,12 +253,7 @@ impl Recorder {
                 "-crf", "30",
                 "-pix_fmt", "yuv420p",
 
-                // segmentation
-                "-f", "segment",
-                "-segment_time", "5",
-                "-reset_timestamps", "1",
-
-                // important for MP4 segments
+                // important for MP4
                 "-movflags", "+faststart",
                 "-strftime", "1",
 
@@ -255,9 +262,10 @@ impl Recorder {
             ])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::inherit())
             .spawn()
             .expect("failed to start ffmpeg");
+
 
         child
     }
@@ -271,7 +279,6 @@ impl Recorder {
             if let Some(stdin) = w.stdin.as_mut() {
                 let _ = stdin.write_all(&frame);
                 stdin.flush().unwrap();
-                // tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
             }
         }
 
