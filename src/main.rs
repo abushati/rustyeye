@@ -207,12 +207,12 @@ impl Camera {
                     };
 
                     prev = Some(img);
-                    println!("{}", motion_ratio);
+                    // println!("{}", motion_ratio);
                     let motion_detected = motion_ratio > CONFIG.video.motion_ratio_threshold;
                     motion_history.push(motion_detected);
 
                     if state_change_cooldown.as_mut().unwrap().elapsed() < Duration::from_secs(CONFIG.video.state_change_cooldown as u64) {
-                        println!("{:?}", state_change_cooldown.as_mut().unwrap().elapsed());
+                        // println!("{:?}", state_change_cooldown.as_mut().unwrap().elapsed());
                         continue;
                     }
 
@@ -306,7 +306,17 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
         child
     }
 
+
+    async fn file_worker(){
+        loop {
+            println!("Starting working");
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+
+    }
+
     fn new(receiver: mpsc::UnboundedReceiver<Vec<u8>>, frame_rate:Arc<Mutex<u32>>) -> Self {
+        tokio::spawn(Recorder::file_worker());
         Self { receiver, mp4_writer: Recorder::start_ffmpeg() , frame_rate }
     }
     // fn file_rotator(&self)
@@ -314,6 +324,7 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
     async fn recorder_task(&mut self) {
         println!("🎬 Recorder started");
         while let Some(frame) = self.receiver.recv().await {
+            println!("Recorder frame", );
             if let Some(stdin) = self.mp4_writer.stdin.as_mut() {
                 let _ = stdin.write_all(&frame);
                 stdin.flush().unwrap();
