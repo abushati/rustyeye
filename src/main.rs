@@ -254,7 +254,7 @@ impl Recorder {
         let filename = Local::now().format(&CONFIG.recorder.file_name_format).to_string();
         let seperator_folder = Local::now().format(&CONFIG.recorder.seperator_folder).to_string();
         let template = &CONFIG.recorder.file_path;
-        let file = template
+        let mut file = template
             .replace("{base_recording_folder}", &CONFIG.recorder.base_recording_folder)
             .replace("{seperator_folder}", &*seperator_folder)
             .replace("{file_name_format}", &*filename);
@@ -268,7 +268,19 @@ impl Recorder {
             println!("Directory already exists: {}", &d);
         }
 
-        println!("Video file {filename}");
+        let mut count = 1;
+        loop {
+            if !Path::new(&file).exists() {
+                break;
+            }
+            let mut v = file.split(".").collect::<Vec<&str>>();
+            let n = &format!("{}_{}", v[0], count.to_string());
+            v[0] = n;
+            file = v.join(".");
+            count += 1;
+        }
+
+        println!("Video file {file}");
 
         let child = Command::new("ffmpeg")
             .args([
@@ -306,7 +318,6 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
         child
     }
 
-
     async fn start(&mut self){
         let mut pervous_hour = None;
         println!("Starting file working");
@@ -316,11 +327,13 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
                 pervous_hour = Some(now_time.hour());
                 if self.mp4_writer.is_none() {
                     self.mp4_writer = Some(Recorder::start_ffmpeg());
+                    self.recorder_task().await;
                 }
             } else {
                 if pervous_hour.as_ref().unwrap().ne(&now_time.hour()) {
                     self.mp4_writer.as_mut().unwrap().kill().unwrap();
                     self.mp4_writer = Some(Recorder::start_ffmpeg());
+                    self.recorder_task().await;
                     pervous_hour = Some(now_time.hour());
                 } else {
                     tokio::time::sleep(Duration::from_secs(1)).await;
@@ -340,7 +353,6 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
         println!("🎬 Recorder started");
         let p = self.mp4_writer.as_mut().unwrap();
         while let Some(frame) = self.receiver.recv().await {
-            println!("Recorder frame", );
             if let Some(stdin) = p.stdin.as_mut() {
                 let _ = stdin.write_all(&frame);
                 stdin.flush().unwrap();
@@ -406,23 +418,6 @@ fn frame_diff(
     changed as f32 / total as f32
 }
 
-
-fn blank_luma(w: u32, h: u32) -> ImageBuffer<Luma<u8>, Vec<u8>> {
-    ImageBuffer::from_pixel(w, h, Luma([0]))
-}
-
-fn encode_jpeg_rgb(img: &RgbImage) -> Vec<u8> {
-    let mut out = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new(&mut out).encode_image(img).unwrap();
-    out
-}
-
-fn encode_jpeg_luma(img: &ImageBuffer<Luma<u8>, Vec<u8>>) -> Vec<u8> {
-    let mut out = Vec::new();
-    image::codecs::jpeg::JpegEncoder::new(&mut out).encode_image(img).unwrap();
-    out
-}
-
 /* ================= MAIN ================= */
 
 #[tokio::main]
@@ -431,7 +426,7 @@ async fn main() {
     let frames = cam.frames.clone();
 
     tokio::spawn(async move { cam.run().await });
-    tokio::spawn(async move { recorder.recorder_task().await });
+    tokio::spawn(async move { recorder.start().await });
 
     let app = Router::new()
         .route("/frame", get({
