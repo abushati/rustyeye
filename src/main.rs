@@ -5,7 +5,7 @@ use image::{GrayImage, ImageBuffer, Luma, RgbImage};
 use std::{process::{Command, Child}, sync::{Arc, Mutex}, time::Duration, io::{Read, Write}, fs, os};
 use std::fmt::format;
 use std::path::Path;
-use chrono::{Local, Utc};
+use chrono::{Local, Timelike, Utc};
 use std::process::Stdio;
 use std::thread::sleep;
 use tokio::sync::mpsc;
@@ -245,7 +245,7 @@ impl Camera {
 
 struct Recorder {
     receiver: mpsc::UnboundedReceiver<Vec<u8>>,
-    mp4_writer: Child,
+    mp4_writer: Option<Child>,
     frame_rate: Arc<Mutex<u32>>,
 }
 
@@ -307,32 +307,48 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
     }
 
 
-    async fn file_worker(){
+    async fn start(&mut self){
+        let mut pervous_hour = None;
+        println!("Starting file working");
         loop {
-            println!("Starting working");
-            tokio::time::sleep(Duration::from_secs(1)).await;
+            let now_time = chrono::Local::now();
+            if pervous_hour.is_none() {
+                pervous_hour = Some(now_time.hour());
+                if self.mp4_writer.is_none() {
+                    self.mp4_writer = Some(Recorder::start_ffmpeg());
+                }
+            } else {
+                if pervous_hour.as_ref().unwrap().ne(&now_time.hour()) {
+                    self.mp4_writer.as_mut().unwrap().kill().unwrap();
+                    self.mp4_writer = Some(Recorder::start_ffmpeg());
+                    pervous_hour = Some(now_time.hour());
+                } else {
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                }
+            }
         }
 
     }
 
     fn new(receiver: mpsc::UnboundedReceiver<Vec<u8>>, frame_rate:Arc<Mutex<u32>>) -> Self {
-        tokio::spawn(Recorder::file_worker());
-        Self { receiver, mp4_writer: Recorder::start_ffmpeg() , frame_rate }
+        Self { receiver, mp4_writer: None , frame_rate }
     }
+
     // fn file_rotator(&self)
 
     async fn recorder_task(&mut self) {
         println!("🎬 Recorder started");
+        let p = self.mp4_writer.as_mut().unwrap();
         while let Some(frame) = self.receiver.recv().await {
             println!("Recorder frame", );
-            if let Some(stdin) = self.mp4_writer.stdin.as_mut() {
+            if let Some(stdin) = p.stdin.as_mut() {
                 let _ = stdin.write_all(&frame);
                 stdin.flush().unwrap();
             }
         }
 
-        let _ = self.mp4_writer.stdin.take();
-        let _ = self.mp4_writer.wait();
+        let _ = p.stdin.take();
+        let _ = p.wait();
         println!("🎬 Recording finished");
     }
 }
