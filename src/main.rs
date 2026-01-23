@@ -1,18 +1,16 @@
 use axum::{Router, routing::get, body::Body, response::IntoResponse};
 use async_stream::stream;
 use bytes::Bytes;
-use image::{GrayImage, ImageBuffer, Luma, RgbImage};
+use image::{GrayImage, Luma};
 use std::{process::{Command, Child}, sync::{Arc, Mutex}, time::Duration, io::{Read, Write}, fs, os};
-use std::fmt::format;
 use std::path::Path;
 use chrono::{Local, Timelike, Utc};
 use std::process::Stdio;
-use std::thread::sleep;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 use serde::Deserialize;
 use lazy_static::lazy_static;
-use tokio::io::join;
+use axum::extract::ws::{WebSocket, Message};
 /* ================= CONFIG ================= */
 
 const PIXEL_NOISE_THRESHOLD: u8 = 8;   // ignore jpeg/ISP jitter
@@ -347,8 +345,6 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
         Self { receiver, mp4_writer: None , frame_rate }
     }
 
-    // fn file_rotator(&self)
-
     async fn recorder_task(&mut self) {
         println!("🎬 Recorder started");
         let p = self.mp4_writer.as_mut().unwrap();
@@ -367,11 +363,15 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
 
 /* ================= HTTP STREAM ================= */
 
+
 async fn stream_mjpeg(
     frames: Arc<Mutex<Frames>>,
     diff: bool,
 ) -> impl IntoResponse {
+
     let body = stream! {
+        let mut count: u64 = 0;
+
         loop {
             let jpeg = {
                 let f = frames.lock().unwrap();
@@ -379,8 +379,25 @@ async fn stream_mjpeg(
             };
 
             if let Some(j) = jpeg {
-                yield Ok::<Bytes, std::convert::Infallible>(Bytes::from("--frame\r\nContent-Type: image/jpeg\r\n\r\n"));
+                count += 1;
+
+                let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
+
+                yield Ok::<Bytes, std::convert::Infallible>(Bytes::from(
+                    format!(
+                        "--frame\r\n\
+                         Content-Type: image/jpeg\r\n\
+                         Content-Length: {}\r\n\
+                         X-Timestamp: {}\r\n\
+                         X-Frame-Count: {}\r\n\r\n",
+                        j.len(),
+                        timestamp,
+                        count
+                    )
+                ));
+
                 yield Ok(Bytes::from(j));
+                yield Ok(Bytes::from("\r\n"));
             }
 
             tokio::time::sleep(Duration::from_millis(50)).await;
