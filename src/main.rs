@@ -12,6 +12,10 @@ use tokio::time::Instant;
 use serde::Deserialize;
 use lazy_static::lazy_static;
 use axum::extract::ws::{WebSocket, Message};
+use tokio::fs::File;
+use reqwest::Client;
+use tokio_util::codec::{BytesCodec, FramedRead};
+use reqwest::multipart;
 /* ================= CONFIG ================= */
 
 const PIXEL_NOISE_THRESHOLD: u8 = 8;   // ignore jpeg/ISP jitter
@@ -217,7 +221,7 @@ impl Camera {
 
                     if motion_detected && state != CameraState::MotionDetected {
                         state = CameraState::MotionDetected;
-                        self.start_temp_recorder
+                        tx.send(vec![255,255,255,255]).unwrap();
                         return state; // return CameraState ✅
                     }
 
@@ -227,6 +231,7 @@ impl Camera {
                             .all(|&x| !x)
                         {
                             state = CameraState::Idle;
+                            tx.send(vec![255,255,255,1]).unwrap();
                             return state; // return CameraState ✅
                         }
                     }
@@ -369,9 +374,48 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
         self.temp_mp4_writer = Some(Self::start_ffmpeg(Mode::Temp));
     }
 
-    fn end_temp_recorder(& mut self) {
-        self.temp_mp4_writer.as_mut().unwrap().kill().unwrap();
+    async fn send_to_discord(&self) {
+        println!("Sending to discord");
+        let channel_id = "1464459882207117334";
+        let bot_token = "MTQ2NDQ1ODQwNjQzMjYwODMyOQ.G1lzZR.F5VyPrO0pNrSxfKk87Ugch75fNANiTqTzkLCys"; // rotate it if leaked
+        let message_content = "🚨 Motion detected on Camera 1";
+        let video_path = "temp_file.mp4";
+
+        let url = format!("https://discord.com/api/v10/channels/{}/messages", channel_id);
+
+        // Prepare multipart (file + payload)
+        let file = File::open(video_path).await.unwrap();
+        let file_stream = FramedRead::new(file, BytesCodec::new());
+        let file_part = multipart::Part::stream(reqwest::Body::wrap_stream(file_stream))
+            .file_name("my_video.mp4")
+            .mime_str("video/mp4").unwrap();
+
+        let form = multipart::Form::new()
+            .text("content", message_content.to_string())
+            .part("file", file_part);
+
+        // Send POST request
+        let client = Client::new();
+        let res = client.post(&url)
+            .header("Authorization", format!("Bot {}", bot_token))
+            .multipart(form)
+            .send()
+            .await;
+
+        // Check result
+
+        let text = res.unwrap().text().await;
+        println!("Failed: | {}", text.unwrap());
+
     }
+
+    async fn end_temp_recorder(& mut self) {
+        self.temp_mp4_writer.as_mut().unwrap().stdin.take();
+        self.temp_mp4_writer.as_mut().unwrap().wait();
+        self.temp_mp4_writer.as_mut().unwrap().kill().unwrap();
+        self.send_to_discord().await;
+    }
+
 
     async fn recorder_task(&mut self) {
         println!("🎬 Recorder started");
@@ -384,7 +428,7 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
                 continue; // skip writing this frame
             } else if message.as_slice() == &[255, 255, 255, 1] {
                 println!("Ending temp mode");
-                self.end_temp_recorder();
+                self.end_temp_recorder().await;
                 continue; // skip writing this frame
             }
 
