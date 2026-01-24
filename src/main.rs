@@ -3,6 +3,7 @@ use async_stream::stream;
 use bytes::Bytes;
 use image::{GrayImage, Luma};
 use std::{process::{Command, Child}, sync::{Arc, Mutex}, time::Duration, io::{Read, Write}, fs, os};
+use std::cmp::PartialEq;
 use std::path::Path;
 use chrono::{Local, Timelike, Utc};
 use std::process::Stdio;
@@ -216,6 +217,7 @@ impl Camera {
 
                     if motion_detected && state != CameraState::MotionDetected {
                         state = CameraState::MotionDetected;
+                        self.start_temp_recorder
                         return state; // return CameraState ✅
                     }
 
@@ -244,11 +246,18 @@ impl Camera {
 struct Recorder {
     receiver: mpsc::UnboundedReceiver<Vec<u8>>,
     mp4_writer: Option<Child>,
+    temp_mp4_writer: Option<Child>,
     frame_rate: Arc<Mutex<u32>>,
 }
 
+#[derive(PartialEq)]
+enum Mode {
+    Temp,
+    Active
+}
+
 impl Recorder {
-    fn start_ffmpeg() -> Child {
+    fn get_file_name() -> String {
         let filename = Local::now().format(&CONFIG.recorder.file_name_format).to_string();
         let seperator_folder = Local::now().format(&CONFIG.recorder.seperator_folder).to_string();
         let template = &CONFIG.recorder.file_path;
@@ -277,8 +286,19 @@ impl Recorder {
             file = v.join(".");
             count += 1;
         }
+        file
+    }
 
-        println!("Video file {file}");
+    fn start_ffmpeg(mode: Mode) -> Child {
+        let mut file = "".to_string();
+        if mode == Mode::Active {
+            file = Recorder::get_file_name();
+        } else {
+            file = "temp_file.mp4".to_string();
+        }
+
+
+        // println!("Video file {file}");
 
         let child = Command::new("ffmpeg")
             .args([
@@ -324,13 +344,13 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
             if pervous_hour.is_none() {
                 pervous_hour = Some(now_time.hour());
                 if self.mp4_writer.is_none() {
-                    self.mp4_writer = Some(Recorder::start_ffmpeg());
+                    self.mp4_writer = Some(Recorder::start_ffmpeg(Mode::Active));
                     self.recorder_task().await;
                 }
             } else {
                 if pervous_hour.as_ref().unwrap().ne(&now_time.hour()) {
                     self.mp4_writer.as_mut().unwrap().kill().unwrap();
-                    self.mp4_writer = Some(Recorder::start_ffmpeg());
+                    self.mp4_writer = Some(Recorder::start_ffmpeg(Mode::Active));
                     self.recorder_task().await;
                     pervous_hour = Some(now_time.hour());
                 } else {
@@ -342,21 +362,56 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
     }
 
     fn new(receiver: mpsc::UnboundedReceiver<Vec<u8>>, frame_rate:Arc<Mutex<u32>>) -> Self {
-        Self { receiver, mp4_writer: None , frame_rate }
+        Self { receiver, mp4_writer: None , temp_mp4_writer: None, frame_rate }
+    }
+
+    fn start_temp_recorder(& mut self) {
+        self.temp_mp4_writer = Some(Self::start_ffmpeg(Mode::Temp));
+    }
+
+    fn end_temp_recorder(& mut self) {
+        self.temp_mp4_writer.as_mut().unwrap().kill().unwrap();
     }
 
     async fn recorder_task(&mut self) {
         println!("🎬 Recorder started");
-        let p = self.mp4_writer.as_mut().unwrap();
-        while let Some(frame) = self.receiver.recv().await {
-            if let Some(stdin) = p.stdin.as_mut() {
-                let _ = stdin.write_all(&frame);
-                stdin.flush().unwrap();
+
+        while let Some(message) = self.receiver.recv().await {
+            // Handle control messages first
+            if message.as_slice() == &[255, 255, 255, 255] {
+                println!("Enabling temp mode");
+                self.start_temp_recorder();
+                continue; // skip writing this frame
+            } else if message.as_slice() == &[255, 255, 255, 1] {
+                println!("Ending temp mode");
+                self.end_temp_recorder();
+                continue; // skip writing this frame
+            }
+
+            // Write to temp recorder first (if active)
+            if let Some(temp_writer) = self.temp_mp4_writer.as_mut() {
+                if let Some(stdin) = temp_writer.stdin.as_mut() {
+                    let _ = stdin.write_all(&message);
+                }
+            }
+
+            // Write to main recorder
+            {
+                if let Some(main_writer) = self.mp4_writer.as_mut() {
+                    if let Some(stdin) = main_writer.stdin.as_mut() {
+                        let _ = stdin.write_all(&message);
+                        let _ = stdin.flush(); // optional for low-latency
+                    }
+                }
             }
         }
 
-        let _ = p.stdin.take();
-        let _ = p.wait();
+        // Finish main recorder
+        if let Some(main_writer) = self.mp4_writer.as_mut() {
+            let _ = main_writer.stdin.take(); // signal EOF
+            let _ = main_writer.wait();       // wait for FFmpeg to finish
+        }
+
         println!("🎬 Recording finished");
     }
 }
