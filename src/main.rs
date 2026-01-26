@@ -270,7 +270,7 @@ impl Camera {
                     if motion_detected && state != CameraState::MotionDetected {
                         state = CameraState::MotionDetected;
                         // let a = frame.clone();
-                        
+
                         ai_check(frame.clone()).unwrap();
                         tx.send(vec![255,255,255,255]).unwrap();
                         return state; // return CameraState ✅
@@ -428,7 +428,7 @@ text='%{localtime}':x=20:y=20:fontsize=24:fontcolor=white:box=1:boxcolor=black@0
     async fn send_to_discord(&self) {
         println!("Sending to discord");
         let channel_id = "1464459882207117334";
-        let bot_token = "MTQ2NDQ1ODQwNjQzMjYwODMyOQ.G1lzZR.F5VyPrO0pNrSxfKk87Ugch75fNANiTqTzkLCys"; // rotate it if leaked
+        let bot_token = ""; // rotate it if leaked
         let message_content = "🚨 Motion detected on Camera 1";
         let video_path = "temp_file.mp4";
 
