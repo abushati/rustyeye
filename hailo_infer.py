@@ -26,16 +26,18 @@ bindings_list.append(bindings)
 def run_inference(frame: np.ndarray):
     #https://github.com/openvinotoolkit/open_model_zoo/blob/55761abd40abce5c4057b0dc47394afed3114d82/data/dataset_classes/coco_80cl.txt#L4
     #The output array person is index 0
-    img = cv.imread("pic3.jpeg")  # shape: (H, W, 3), BGR format
-    print("Original shape:", img.shape)
+    # img = cv.imread("pic3.jpeg")  # shape: (H, W, 3), BGR format
+    # print("Original shape:", img.shape)
 
     # Convert to float32
-    img_float = img.astype(np.float32)
-    img_resized = cv.resize(frame, (416, 416))
+    # img_float = img.astype(np.float32)
+    img = cv.imdecode(np.frombuffer(frame, np.uint8), cv.IMREAD_COLOR)
 
-    # Flatten to 1D for HailoRT
-    frame = img_resized.ravel()
-    # frame = np.zeros((416, 416, 3), dtype=np.float32).ravel()
+    img = cv.resize(img, (416, 416))        # or 832x832
+    img = img.astype(np.float32)
+
+    frame = img.ravel()
+# frame = np.zeros((416, 416, 3), dtype=np.float32).ravel()
     # frame_resized = cv.resize(frame, (832,832))
     bindings.input().set_buffer(frame.astype(np.float32))
     # allocate output buffer based on model output shape
@@ -50,7 +52,7 @@ def run_inference(frame: np.ndarray):
 
     return bindings.output().get_buffer()
 
-t = run_inference(0)
-for i,ar in enumerate(t):
-    if ar.size > 0:
-        print(i)
+# t = run_inference(0)
+# for i,ar in enumerate(t):
+#     if ar.size > 0:
+#         print(i)
